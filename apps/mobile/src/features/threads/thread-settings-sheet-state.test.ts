@@ -3,7 +3,11 @@ import { describe, expect, it } from "vite-plus/test";
 import { ProviderInstanceId, type ProviderOptionSelection } from "@t3tools/contracts";
 
 import type { ModelOption } from "../../lib/modelOptions";
-import { modelMatchesCatalogQuery, pendingModelAfterPress } from "./thread-settings-sheet-state";
+import {
+  modelMatchesCatalogQuery,
+  pendingModelAfterPress,
+  providerSectionIsCollapsed,
+} from "./thread-settings-sheet-state";
 
 function modelOption(
   model: string,
@@ -80,5 +84,49 @@ describe("thread settings sheet state", () => {
         pressedIsApplied: false,
       }),
     ).toBe(pressed);
+  });
+
+  it("keeps primary providers open until the user collapses them", () => {
+    expect(
+      providerSectionIsCollapsed({
+        defaultExpanded: true,
+        hasExpansionOverride: false,
+        isNarrowed: false,
+      }),
+    ).toBe(false);
+    expect(
+      providerSectionIsCollapsed({
+        defaultExpanded: true,
+        hasExpansionOverride: true,
+        isNarrowed: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps secondary providers closed until the user expands them", () => {
+    expect(
+      providerSectionIsCollapsed({
+        defaultExpanded: false,
+        hasExpansionOverride: false,
+        isNarrowed: false,
+      }),
+    ).toBe(true);
+    expect(
+      providerSectionIsCollapsed({
+        defaultExpanded: false,
+        hasExpansionOverride: true,
+        isNarrowed: false,
+      }),
+    ).toBe(false);
+  });
+
+  it("shows all matching rows while search or provider filters are active", () => {
+    expect(
+      providerSectionIsCollapsed({
+        defaultExpanded: false,
+        hasExpansionOverride: false,
+        isNarrowed: true,
+      }),
+    ).toBe(false);
   });
 });

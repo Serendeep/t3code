@@ -30,3 +30,18 @@ export function pendingModelAfterPress(input: {
   }
   return input.current?.key === input.pressed.key ? input.current : input.pressed;
 }
+
+/**
+ * Primary and selected providers start open; all other catalogs start closed.
+ * A user's disclosure tap inverts that default until the picker is dismissed.
+ */
+export function providerSectionIsCollapsed(input: {
+  readonly defaultExpanded: boolean;
+  readonly hasExpansionOverride: boolean;
+  readonly isNarrowed: boolean;
+}): boolean {
+  if (input.isNarrowed) {
+    return false;
+  }
+  return input.defaultExpanded ? input.hasExpansionOverride : !input.hasExpansionOverride;
+}

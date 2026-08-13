@@ -44,7 +44,12 @@ import type { ModelOption, ProviderGroup } from "../../lib/modelOptions";
 import { applyProviderOptionSelection } from "../../lib/providerOptions";
 import { resolveProviderOptionDescriptors } from "../../lib/providerOptions";
 import { useThemeColor } from "../../lib/useThemeColor";
-import { NativeHeaderToolbar, NativeStackScreenOptions } from "../../native/StackHeader";
+import {
+  NativeHeaderToolbar,
+  NativeStackScreenOptions,
+  nativeHeaderScrollEdgeEffects,
+} from "../../native/StackHeader";
+import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import {
   NATIVE_SHEET_SURFACE_COLOR,
   NATIVE_SHEET_SURFACE_CONTENT_STYLE,
@@ -57,14 +62,22 @@ import {
   NATIVE_MAIL_SEARCH_TOOLBAR_SUPPORTED,
 } from "../layout/native-mail-search-toolbar";
 import { RUNTIME_MODE_CHOICES, selectableChoices } from "./thread-settings-options";
-import { modelMatchesCatalogQuery, pendingModelAfterPress } from "./thread-settings-sheet-state";
+import {
+  modelMatchesCatalogQuery,
+  pendingModelAfterPress,
+  providerSectionIsCollapsed,
+} from "./thread-settings-sheet-state";
 
 /**
- * The everyday harnesses stay expanded; every other provider (OpenRouter
- * catalogs and friends) folds behind its header so a 300-model catalog can't
- * bury the list.
+ * Everyday harnesses start expanded; every other provider (OpenRouter catalogs
+ * and friends) starts folded so a 300-model catalog cannot bury the list. All
+ * provider headers remain user-collapsible.
  */
 const PRIMARY_PROVIDER_DRIVERS: ReadonlySet<string> = new Set(["claudeAgent", "codex"]);
+const THREAD_SETTINGS_HEADER_SCROLL_EDGE_EFFECTS = nativeHeaderScrollEdgeEffects(
+  Platform.OS,
+  Platform.Version,
+);
 function ModelRow(props: {
   readonly option: ModelOption;
   readonly selected: boolean;
@@ -323,7 +336,7 @@ type ThreadSettingsSessionValue = {
   readonly runtimeMode: RuntimeMode;
   readonly onUpdateRuntimeMode: (mode: RuntimeMode) => void;
   readonly displayedDescriptors: ReadonlyArray<ProviderOptionDescriptor>;
-  readonly expandedProviders: ReadonlySet<string>;
+  readonly providerExpansionOverrides: ReadonlySet<string>;
   readonly hasLegacyModels: boolean;
   readonly pendingModel: ModelOption | null;
   readonly providerFilter: string | null;
@@ -348,7 +361,9 @@ function ThreadSettingsSessionProvider(
   const [showLegacyToggle, setShowLegacyToggle] = useState(false);
   const [providerFilter, setProviderFilter] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
-  const [expandedProviders, setExpandedProviders] = useState<ReadonlySet<string>>(() => new Set());
+  const [providerExpansionOverrides, setProviderExpansionOverrides] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const [pendingModel, setPendingModel] = useState<ModelOption | null>(null);
 
   const isApplied = useCallback(
@@ -409,7 +424,7 @@ function ThreadSettingsSessionProvider(
   );
 
   const toggleProvider = useCallback((providerKey: string) => {
-    setExpandedProviders((current) => {
+    setProviderExpansionOverrides((current) => {
       const next = new Set(current);
       if (!next.delete(providerKey)) {
         next.add(providerKey);
@@ -438,7 +453,7 @@ function ThreadSettingsSessionProvider(
       runtimeMode: props.runtimeMode,
       onUpdateRuntimeMode: props.onUpdateRuntimeMode,
       displayedDescriptors,
-      expandedProviders,
+      providerExpansionOverrides,
       hasLegacyModels,
       pendingModel,
       providerFilter,
@@ -457,7 +472,7 @@ function ThreadSettingsSessionProvider(
       applyOptionChange,
       commitPendingModel,
       displayedDescriptors,
-      expandedProviders,
+      providerExpansionOverrides,
       hasLegacyModels,
       isDisplayed,
       pendingModel,
@@ -584,8 +599,12 @@ function useThreadSettingsModelSections(
         const isPrimary = driver !== undefined && PRIMARY_PROVIDER_DRIVERS.has(driver);
         const containsSelection = group.models.some(session.isDisplayed);
         const isNarrowed = session.providerFilter !== null || session.searchQuery.trim().length > 0;
-        const collapsible = !isPrimary && !containsSelection && !isNarrowed;
-        const collapsed = collapsible && !session.expandedProviders.has(group.providerKey);
+        const collapsible = !isNarrowed;
+        const collapsed = providerSectionIsCollapsed({
+          defaultExpanded: isPrimary || containsSelection,
+          hasExpansionOverride: session.providerExpansionOverrides.has(group.providerKey),
+          isNarrowed,
+        });
         return [
           {
             key: group.providerKey,
@@ -599,8 +618,8 @@ function useThreadSettingsModelSections(
         ];
       }),
     [
-      session.expandedProviders,
       session.isDisplayed,
+      session.providerExpansionOverrides,
       session.providerFilter,
       session.providerGroups,
       session.searchQuery,
@@ -893,6 +912,7 @@ function ThreadSettingsModelsScreen() {
                   onSearchTextChange: session.setSearchQuery,
                   placeholder: "Find a model",
                   searchTextChangeId: "thread-settings-model-search-text",
+                  showsSearchDismissButton: true,
                 }),
               ]
             : undefined,
@@ -1015,9 +1035,17 @@ function ThreadSettingsPickerNavigator(props: ThreadSettingsPickerPresentation) 
           headerBackButtonDisplayMode: "minimal",
           headerBackTitle: "",
           headerShadowVisible: false,
-          headerStyle: { backgroundColor: nativeSheetBackground as unknown as string },
+          headerStyle: {
+            backgroundColor: (NATIVE_LIQUID_GLASS_SUPPORTED
+              ? "transparent"
+              : nativeSheetBackground) as unknown as string,
+          },
+          headerTransparent: NATIVE_LIQUID_GLASS_SUPPORTED,
           headerTintColor: foreground,
           headerTitleStyle: { fontSize: 17, fontWeight: "700" },
+          scrollEdgeEffects: NATIVE_LIQUID_GLASS_SUPPORTED
+            ? THREAD_SETTINGS_HEADER_SCROLL_EDGE_EFFECTS
+            : undefined,
         }}
       >
         <ThreadSettingsPickerStack.Screen
