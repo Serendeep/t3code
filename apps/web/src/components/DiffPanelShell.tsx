@@ -14,7 +14,7 @@ function getDiffPanelHeaderRowClassName(mode: DiffPanelMode) {
     mode === "embedded" ? "px-2" : "px-4",
     shouldUseDragRegion
       ? "drag-region h-[52px] border-b border-border wco:h-[env(titlebar-area-height)] wco:pr-[calc(100vw-env(titlebar-area-width)-env(titlebar-area-x)+1em)]"
-      : "surface-subheader",
+      : "flex h-10 min-h-10 shrink-0 items-center border-b border-border/60 bg-background",
   );
 }
 
