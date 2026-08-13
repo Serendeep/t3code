@@ -3,9 +3,41 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   resolveNewTaskBranchWorktreePath,
   resolveNewTaskBranchLabel,
+  resolveNewTaskLocalWorkspaceSelection,
   resolveNewTaskWorkspaceLabel,
   shouldCheckoutNewTaskBranch,
 } from "./new-task-context-presentation";
+
+describe("resolveNewTaskLocalWorkspaceSelection", () => {
+  it("waits for refs instead of carrying a worktree base into Current checkout", () => {
+    expect(
+      resolveNewTaskLocalWorkspaceSelection({
+        branches: [],
+        projectCwd: "/repo",
+      }),
+    ).toEqual({
+      branch: null,
+      worktreePath: null,
+      awaitsCurrentBranch: true,
+    });
+  });
+
+  it("adopts the checkout's current branch once refs load", () => {
+    expect(
+      resolveNewTaskLocalWorkspaceSelection({
+        branches: [
+          { name: "feature/worktree-base", current: false, worktreePath: "/worktree" },
+          { name: "main", current: true, worktreePath: "/repo" },
+        ],
+        projectCwd: "/repo",
+      }),
+    ).toEqual({
+      branch: "main",
+      worktreePath: null,
+      awaitsCurrentBranch: false,
+    });
+  });
+});
 
 describe("resolveNewTaskBranchWorktreePath", () => {
   it("moves Current checkout to the selected existing worktree", () => {

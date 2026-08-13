@@ -25,6 +25,38 @@ export function resolveNewTaskBranchWorktreePath(input: {
   return input.branchWorktreePath;
 }
 
+export function resolveNewTaskLocalWorkspaceSelection(input: {
+  readonly branches: ReadonlyArray<{
+    readonly name: string;
+    readonly current: boolean;
+    readonly worktreePath?: string | null;
+  }>;
+  readonly projectCwd: string;
+}): {
+  readonly branch: string | null;
+  readonly worktreePath: string | null;
+  readonly awaitsCurrentBranch: boolean;
+} {
+  const currentBranch = input.branches.find((branch) => branch.current) ?? null;
+  if (!currentBranch) {
+    return {
+      branch: null,
+      worktreePath: null,
+      awaitsCurrentBranch: true,
+    };
+  }
+
+  return {
+    branch: currentBranch.name,
+    worktreePath: resolveNewTaskBranchWorktreePath({
+      workspaceMode: "local",
+      projectCwd: input.projectCwd,
+      branchWorktreePath: currentBranch.worktreePath,
+    }),
+    awaitsCurrentBranch: false,
+  };
+}
+
 export function resolveNewTaskBranchLabel(input: {
   readonly branchName: string | null;
   readonly startFromOrigin: boolean;

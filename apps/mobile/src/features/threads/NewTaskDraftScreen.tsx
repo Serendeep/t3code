@@ -1035,6 +1035,7 @@ export function NewTaskDraftScreen(props: {
         {heroViewport}
 
         <KeyboardStickyView
+          enabled={isKeyboardVisible}
           style={{ position: "absolute", bottom: 0, left: 0, right: 0 }}
           offset={{ closed: 0, opened: keyboardOpenedOffset }}
         >
@@ -1063,6 +1064,7 @@ export function NewTaskDraftScreen(props: {
 
       {heroViewport}
       <KeyboardStickyView
+        enabled={isKeyboardVisible}
         style={{ position: "absolute", bottom: 0, left: 0, right: 0 }}
         offset={{ closed: 0, opened: keyboardOpenedOffset }}
       >

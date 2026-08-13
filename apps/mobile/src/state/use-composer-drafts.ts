@@ -253,7 +253,11 @@ export function ensureComposerDraftsLoaded(): void {
 function updateComposerDrafts(
   update: (current: Record<string, ComposerDraft>) => Record<string, ComposerDraft>,
 ): void {
-  const next = update(appAtomRegistry.get(composerDraftsAtom));
+  const current = appAtomRegistry.get(composerDraftsAtom);
+  const next = update(current);
+  if (next === current) {
+    return;
+  }
   appAtomRegistry.set(composerDraftsAtom, next);
   schedulePersistComposerDrafts(next);
 }

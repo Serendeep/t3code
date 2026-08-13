@@ -76,7 +76,10 @@ import {
 } from "../home/homeThreadList";
 import { useMobileProjectGroupingSettings } from "../../state/project-grouping";
 import { useLegacyPlanModeEnabled } from "./use-legacy-plan-mode-enabled";
-import { resolveNewTaskBranchWorktreePath } from "./new-task-context-presentation";
+import {
+  resolveNewTaskBranchWorktreePath,
+  resolveNewTaskLocalWorkspaceSelection,
+} from "./new-task-context-presentation";
 
 type WorkspaceMode = "local" | "worktree";
 
@@ -216,6 +219,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
   const [branchQuery, setBranchQuery] = useState("");
   const [expandedProvider, setExpandedProvider] = useState<string | null>(null);
   const [editingPendingTask, setEditingPendingTask] = useState<QueuedThreadMessage | null>(null);
+  const pendingLocalBranchSyncDraftKeysRef = useRef(new Set<string>());
   // Mirrors `editingPendingTask` synchronously so the unmount flush cannot act
   // on a task whose editing session already ended this render.
   const editingPendingTaskRef = useRef<QueuedThreadMessage | null>(null);
@@ -226,6 +230,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
     setSubmitting(false);
     setBranchQuery("");
     setExpandedProvider(null);
+    pendingLocalBranchSyncDraftKeysRef.current.clear();
     const editing = editingPendingTaskRef.current;
     editingPendingTaskRef.current = null;
     setEditingPendingTask(null);
@@ -605,13 +610,23 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       if (!selectedProjectDraftKey) {
         return;
       }
-      const currentBranch = availableBranches.find((branch) => branch.current) ?? null;
+      if (!selectedProject) {
+        return;
+      }
+      const localSelection = resolveNewTaskLocalWorkspaceSelection({
+        branches: availableBranches,
+        projectCwd: selectedProject.workspaceRoot,
+      });
+      if (mode === "local" && localSelection.awaitsCurrentBranch) {
+        pendingLocalBranchSyncDraftKeysRef.current.add(selectedProjectDraftKey);
+      } else {
+        pendingLocalBranchSyncDraftKeysRef.current.delete(selectedProjectDraftKey);
+      }
       updateComposerDraftSettings(selectedProjectDraftKey, {
         workspaceSelection: {
           mode,
-          branch:
-            mode === "local" ? (currentBranch?.name ?? selectedBranchName) : selectedBranchName,
-          worktreePath: mode === "local" ? null : selectedWorktreePath,
+          branch: mode === "local" ? localSelection.branch : selectedBranchName,
+          worktreePath: mode === "local" ? localSelection.worktreePath : selectedWorktreePath,
           ...(draftStartFromOrigin !== undefined ? { startFromOrigin: draftStartFromOrigin } : {}),
         },
       });
@@ -620,16 +635,52 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       availableBranches,
       draftStartFromOrigin,
       selectedBranchName,
+      selectedProject,
       selectedProjectDraftKey,
       selectedWorktreePath,
     ],
   );
+
+  useEffect(() => {
+    if (
+      workspaceMode !== "local" ||
+      !selectedProject ||
+      !selectedProjectDraftKey ||
+      !pendingLocalBranchSyncDraftKeysRef.current.has(selectedProjectDraftKey)
+    ) {
+      return;
+    }
+    const localSelection = resolveNewTaskLocalWorkspaceSelection({
+      branches: availableBranches,
+      projectCwd: selectedProject.workspaceRoot,
+    });
+    if (localSelection.awaitsCurrentBranch) {
+      return;
+    }
+
+    pendingLocalBranchSyncDraftKeysRef.current.delete(selectedProjectDraftKey);
+    updateComposerDraftSettings(selectedProjectDraftKey, {
+      workspaceSelection: {
+        mode: "local",
+        branch: localSelection.branch,
+        worktreePath: localSelection.worktreePath,
+        ...(draftStartFromOrigin !== undefined ? { startFromOrigin: draftStartFromOrigin } : {}),
+      },
+    });
+  }, [
+    availableBranches,
+    draftStartFromOrigin,
+    selectedProject,
+    selectedProjectDraftKey,
+    workspaceMode,
+  ]);
 
   const selectBranch = useCallback(
     (branch: VcsRef) => {
       if (!selectedProject || !selectedProjectDraftKey) {
         return;
       }
+      pendingLocalBranchSyncDraftKeysRef.current.delete(selectedProjectDraftKey);
       updateComposerDraftSettings(selectedProjectDraftKey, {
         workspaceSelection: {
           mode: workspaceMode,

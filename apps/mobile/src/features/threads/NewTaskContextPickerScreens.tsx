@@ -160,12 +160,6 @@ export function NewTaskBranchPickerRouteScreen() {
     flow.availableBranches.find((branch) => branch.isDefault)?.name ??
     null;
 
-  useEffect(() => {
-    if (!flow.branchesLoading && flow.availableBranches.length === 0) {
-      void flow.loadBranches();
-    }
-  }, [flow.availableBranches.length, flow.branchesLoading, flow.loadBranches]);
-
   useEffect(
     () => () => {
       flow.setBranchQuery("");
@@ -190,7 +184,7 @@ export function NewTaskBranchPickerRouteScreen() {
       const result = await switchRef({
         environmentId: flow.selectedProject.environmentId,
         input: {
-          cwd: flow.selectedWorktreePath ?? flow.selectedProject.workspaceRoot,
+          cwd: flow.selectedProject.workspaceRoot,
           refName: branch.name,
         },
       });
