@@ -5,7 +5,7 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import * as Haptics from "expo-haptics";
 import { useNavigation } from "@react-navigation/native";
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -13,6 +13,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  Switch,
   TextInput,
   View,
 } from "react-native";
@@ -29,6 +30,7 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { vcsEnvironment } from "../../state/vcs";
 import {
   createNativeMailSearchToolbarItem,
+  NATIVE_MAIL_SEARCH_TOOLBAR_CONTENT_INSET,
   NATIVE_MAIL_SEARCH_TOOLBAR_SUPPORTED,
 } from "../layout/native-mail-search-toolbar";
 import { branchBadgeLabel, useNewTaskFlow } from "./new-task-flow-provider";
@@ -38,7 +40,6 @@ function SelectionRow(props: {
   readonly icon?: "arrow.triangle.branch" | "desktopcomputer";
   readonly onPress: () => void;
   readonly disabled?: boolean;
-  readonly selectionStyle?: "checkmark" | "checkbox";
   readonly selected: boolean;
   readonly isLast?: boolean;
   readonly subtitle?: string;
@@ -46,14 +47,12 @@ function SelectionRow(props: {
 }) {
   const iconColor = useThemeColor("--color-icon-muted");
   const checkmarkColor = useThemeColor("--color-icon");
-  const usesCheckbox = props.selectionStyle === "checkbox";
-  const rowIcon = usesCheckbox ? (props.selected ? "checkmark.circle" : "circle") : props.icon;
 
   return (
     <Pressable
       accessibilityLabel={[props.title, props.subtitle].filter(Boolean).join(", ")}
-      accessibilityRole={usesCheckbox ? "checkbox" : "button"}
-      accessibilityState={usesCheckbox ? { checked: props.selected } : { selected: props.selected }}
+      accessibilityRole="radio"
+      accessibilityState={{ checked: props.selected }}
       className={cn(
         "min-h-14 flex-row items-center gap-3 bg-card px-4 py-3 active:bg-subtle",
         !props.isLast && "border-b border-border-subtle",
@@ -62,13 +61,8 @@ function SelectionRow(props: {
       onPress={props.onPress}
       style={{ opacity: props.disabled ? 0.45 : 1 }}
     >
-      {rowIcon ? (
-        <SymbolView
-          name={rowIcon}
-          size={17}
-          tintColor={usesCheckbox && props.selected ? checkmarkColor : iconColor}
-          type="monochrome"
-        />
+      {props.icon ? (
+        <SymbolView name={props.icon} size={17} tintColor={iconColor} type="monochrome" />
       ) : null}
       <View className="min-w-0 flex-1 gap-0.5">
         <Text className="text-base font-t3-medium text-foreground" numberOfLines={1}>
@@ -80,7 +74,7 @@ function SelectionRow(props: {
           </Text>
         ) : null}
       </View>
-      {props.selected && !usesCheckbox ? (
+      {props.selected ? (
         <SymbolView
           name="checkmark"
           size={16}
@@ -90,6 +84,64 @@ function SelectionRow(props: {
         />
       ) : null}
     </Pressable>
+  );
+}
+
+function ToggleRow(props: {
+  readonly title: string;
+  readonly subtitle?: string;
+  readonly value: boolean;
+  readonly onValueChange: (value: boolean) => void;
+}) {
+  return (
+    <View className="min-h-14 flex-row items-center gap-3 bg-card px-4 py-3">
+      <View className="min-w-0 flex-1 gap-0.5">
+        <Text className="text-base font-t3-medium text-foreground" numberOfLines={1}>
+          {props.title}
+        </Text>
+        {props.subtitle ? (
+          <Text className="text-xs text-foreground-muted" numberOfLines={1}>
+            {props.subtitle}
+          </Text>
+        ) : null}
+      </View>
+      <Switch
+        accessibilityLabel={props.title}
+        onValueChange={props.onValueChange}
+        value={props.value}
+      />
+    </View>
+  );
+}
+
+function BranchSelectionRow(props: {
+  readonly badge: string | null;
+  readonly branch: VcsRef;
+  readonly disabled: boolean;
+  readonly isFirst: boolean;
+  readonly isLast: boolean;
+  readonly onSelect: (branch: VcsRef) => void;
+  readonly selected: boolean;
+}) {
+  const onPress = useCallback(() => props.onSelect(props.branch), [props.branch, props.onSelect]);
+
+  return (
+    <View
+      className={cn(
+        props.isFirst && "overflow-hidden rounded-t-2xl",
+        props.isLast && "overflow-hidden rounded-b-2xl",
+      )}
+    >
+      <SelectionRow
+        icon="arrow.triangle.branch"
+        disabled={props.disabled}
+        isLast={props.isLast}
+        onPress={onPress}
+        selected={props.selected}
+        subtitle={props.badge ? props.badge.toUpperCase() : undefined}
+        title={props.branch.name}
+      />
+    </View>
   );
 }
 
@@ -167,50 +219,82 @@ export function NewTaskBranchPickerRouteScreen() {
     [flow.setBranchQuery],
   );
 
-  const selectBranch = async (branch: VcsRef) => {
-    if (switchingBranchName !== null) {
-      return;
-    }
-    void Haptics.selectionAsync();
-
-    let selectedBranch = branch;
-    const needsCheckout = shouldCheckoutNewTaskBranch({
-      branchIsCurrent: branch.current,
-      branchWorktreePath: branch.worktreePath,
-      workspaceMode: flow.workspaceMode,
-    });
-    if (needsCheckout && flow.selectedProject) {
-      setSwitchingBranchName(branch.name);
-      const result = await switchRef({
-        environmentId: flow.selectedProject.environmentId,
-        input: {
-          cwd: flow.selectedProject.workspaceRoot,
-          refName: branch.name,
-        },
-      });
-      setSwitchingBranchName(null);
-      if (result._tag === "Failure") {
-        if (!isAtomCommandInterrupted(result)) {
-          const error = squashAtomCommandFailure(result);
-          Alert.alert(
-            "Could not switch branch",
-            error instanceof Error ? error.message : "The branch could not be checked out.",
-          );
-        }
+  const selectBranch = useCallback(
+    async (branch: VcsRef) => {
+      if (switchingBranchName !== null) {
         return;
       }
-      selectedBranch = {
-        ...branch,
-        current: true,
-        isRemote: false,
-        name: result.value.refName ?? branch.name,
-      };
-    }
+      void Haptics.selectionAsync();
 
-    flow.selectBranch(selectedBranch);
-    flow.setBranchQuery("");
-    navigation.goBack();
-  };
+      let selectedBranch = branch;
+      const needsCheckout = shouldCheckoutNewTaskBranch({
+        branchIsCurrent: branch.current,
+        branchWorktreePath: branch.worktreePath,
+        workspaceMode: flow.workspaceMode,
+      });
+      if (needsCheckout && flow.selectedProject) {
+        setSwitchingBranchName(branch.name);
+        const result = await switchRef({
+          environmentId: flow.selectedProject.environmentId,
+          input: {
+            cwd: flow.selectedProject.workspaceRoot,
+            refName: branch.name,
+          },
+        });
+        setSwitchingBranchName(null);
+        if (result._tag === "Failure") {
+          if (!isAtomCommandInterrupted(result)) {
+            const error = squashAtomCommandFailure(result);
+            Alert.alert(
+              "Could not switch branch",
+              error instanceof Error ? error.message : "The branch could not be checked out.",
+            );
+          }
+          return;
+        }
+        selectedBranch = {
+          ...branch,
+          current: true,
+          isRemote: false,
+          name: result.value.refName ?? branch.name,
+        };
+      }
+
+      flow.selectBranch(selectedBranch);
+      flow.setBranchQuery("");
+      navigation.goBack();
+    },
+    [
+      flow.selectBranch,
+      flow.selectedProject,
+      flow.setBranchQuery,
+      flow.workspaceMode,
+      navigation,
+      switchRef,
+      switchingBranchName,
+    ],
+  );
+
+  const renderBranch = useCallback(
+    ({ item, index }: { readonly item: VcsRef; readonly index: number }) => (
+      <BranchSelectionRow
+        badge={branchBadgeLabel({ branch: item, project: flow.selectedProject })}
+        branch={item}
+        disabled={switchingBranchName !== null}
+        isFirst={index === 0}
+        isLast={index === flow.filteredBranches.length - 1}
+        onSelect={selectBranch}
+        selected={selectedBranchName === item.name}
+      />
+    ),
+    [
+      flow.filteredBranches.length,
+      flow.selectedProject,
+      selectBranch,
+      selectedBranchName,
+      switchingBranchName,
+    ],
+  );
 
   const branchList = (
     <FlatList
@@ -220,7 +304,11 @@ export function NewTaskBranchPickerRouteScreen() {
       contentInsetAdjustmentBehavior="automatic"
       contentContainerStyle={{
         flexGrow: flow.filteredBranches.length === 0 ? 1 : undefined,
-        paddingBottom: Platform.OS === "ios" ? 16 : Math.max(insets.bottom, 16) + 16,
+        paddingBottom: usesNativeMailSearchToolbar
+          ? NATIVE_MAIL_SEARCH_TOOLBAR_CONTENT_INSET + 16
+          : Platform.OS === "ios"
+            ? 16
+            : Math.max(insets.bottom, 16) + 16,
         paddingHorizontal: 16,
         paddingTop: 12,
       }}
@@ -233,45 +321,20 @@ export function NewTaskBranchPickerRouteScreen() {
       ListHeaderComponent={
         flow.workspaceMode === "worktree" ? (
           <View className="mb-3 overflow-hidden rounded-2xl">
-            <SelectionRow
-              isLast
-              onPress={() => {
-                void Haptics.selectionAsync();
-                flow.setStartFromOrigin(!flow.startFromOrigin);
-              }}
-              selected={flow.startFromOrigin}
-              selectionStyle="checkbox"
+            <ToggleRow
+              onValueChange={flow.setStartFromOrigin}
               subtitle={
                 selectedBranchName
                   ? `Start from origin/${selectedBranchName}`
                   : "Start from the latest remote branch"
               }
               title="Latest origin"
+              value={flow.startFromOrigin}
             />
           </View>
         ) : null
       }
-      renderItem={({ item, index }) => {
-        const badge = branchBadgeLabel({ branch: item, project: flow.selectedProject });
-        return (
-          <View
-            className={cn(
-              index === 0 && "overflow-hidden rounded-t-2xl",
-              index === flow.filteredBranches.length - 1 && "overflow-hidden rounded-b-2xl",
-            )}
-          >
-            <SelectionRow
-              icon="arrow.triangle.branch"
-              disabled={switchingBranchName !== null}
-              isLast={index === flow.filteredBranches.length - 1}
-              onPress={() => void selectBranch(item)}
-              selected={selectedBranchName === item.name}
-              subtitle={badge ? badge.toUpperCase() : undefined}
-              title={item.name}
-            />
-          </View>
-        );
-      }}
+      renderItem={renderBranch}
       ListEmptyComponent={
         <View className="flex-1 items-center justify-center gap-3 px-8 py-16">
           {flow.branchesLoading ? <ActivityIndicator /> : null}

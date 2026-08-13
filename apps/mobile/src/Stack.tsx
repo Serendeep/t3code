@@ -305,7 +305,7 @@ const NewTaskSheetStack = createNativeStackNavigator({
           ? { presentation: "card" as const }
           : {
               ...FORM_SHEET_PRESENTATION_OPTIONS,
-              sheetAllowedDetents: [0.86],
+              sheetAllowedDetents: [1],
               sheetGrabberVisible: true,
             }),
       },
@@ -526,7 +526,7 @@ export const RootStack = createNativeStackNavigator({
           ? { presentation: "card" as const }
           : {
               ...FORM_SHEET_PRESENTATION_OPTIONS,
-              sheetAllowedDetents: [0.86],
+              sheetAllowedDetents: [1],
               sheetGrabberVisible: true,
             }),
       },

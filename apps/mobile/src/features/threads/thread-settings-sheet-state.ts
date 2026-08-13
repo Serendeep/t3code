@@ -1,5 +1,24 @@
 import type { ModelOption } from "../../lib/modelOptions";
 
+/** Match the terms a user can actually see or recognize in the model picker. */
+export function modelMatchesCatalogQuery(input: {
+  readonly model: ModelOption;
+  readonly providerLabel: string;
+  readonly query: string;
+}): boolean {
+  const query = input.query.trim().toLocaleLowerCase();
+  if (query.length === 0) {
+    return true;
+  }
+
+  return [
+    input.model.label,
+    input.model.subtitle,
+    input.model.selection.model,
+    input.providerLabel,
+  ].some((value) => value.toLocaleLowerCase().includes(query));
+}
+
 /** Preserve staged provider options when the highlighted model is tapped again. */
 export function pendingModelAfterPress(input: {
   readonly current: ModelOption | null;
