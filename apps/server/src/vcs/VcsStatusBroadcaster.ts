@@ -6,6 +6,7 @@ import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
@@ -135,6 +136,11 @@ interface ActiveRemotePoller {
   readonly demandCwds: Ref.Ref<ReadonlyMap<string, number>>;
 }
 
+interface ActiveLocalWatcher {
+  readonly fiber: Fiber.Fiber<void, never>;
+  readonly subscriberCount: number;
+}
+
 interface StreamStatusOptions {
   readonly automaticRemoteRefreshInterval?: Effect.Effect<Duration.Duration, never>;
 }
@@ -184,6 +190,7 @@ export const make = Effect.gen(function* () {
   const workflow = yield* GitWorkflowService.GitWorkflowService;
   const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
   const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const changesPubSub = yield* Effect.acquireRelease(
     PubSub.unbounded<VcsStatusChange>(),
     (pubsub) => PubSub.shutdown(pubsub),
@@ -193,6 +200,7 @@ export const make = Effect.gen(function* () {
   );
   const cacheRef = yield* Ref.make(new Map<string, CachedVcsStatus>());
   const pollersRef = yield* SynchronizedRef.make(new Map<string, ActiveRemotePoller>());
+  const localWatchersRef = yield* SynchronizedRef.make(new Map<string, ActiveLocalWatcher>());
 
   const getCachedStatus = Effect.fn("VcsStatusBroadcaster.getCachedStatus")(function* (
     cwd: string,
@@ -352,6 +360,100 @@ export const make = Effect.gen(function* () {
   )(function* (rawCwd) {
     const cwd = yield* withFileSystem(normalizeCwd(rawCwd));
     return yield* refreshLocalStatusCore(cwd);
+  });
+
+  const makeLocalWatcher = Effect.fn("VcsStatusBroadcaster.makeLocalWatcher")(function* (
+    cwd: string,
+  ) {
+    const rawHeadPath = yield* workflow.localStatusWatchPath({ cwd }).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Failed to resolve the Git HEAD watch path", {
+          cwdLength: cwd.length,
+          failureTag: diagnosticValueTag(error),
+          failureOperation: diagnosticFailureOperation(error),
+        }).pipe(Effect.as(null)),
+      ),
+    );
+    if (rawHeadPath === null) {
+      return null;
+    }
+
+    const headPath = path.isAbsolute(rawHeadPath) ? rawHeadPath : path.resolve(cwd, rawHeadPath);
+    const headDirectory = path.dirname(headPath);
+    const headFileName = path.basename(headPath);
+    const refreshSafely = refreshLocalStatusCore(cwd).pipe(
+      Effect.ignoreCause({ log: true }),
+      Effect.asVoid,
+    );
+    const headChanges = fs.watch(headDirectory).pipe(
+      Stream.filter((event) => {
+        return (
+          event.path === headPath ||
+          event.path === headFileName ||
+          path.resolve(headDirectory, event.path) === headPath
+        );
+      }),
+      Stream.debounce(Duration.millis(50)),
+    );
+
+    return yield* Stream.runForEach(headChanges, () => refreshSafely).pipe(
+      Effect.ignoreCause({ log: true }),
+      Effect.forkIn(broadcasterScope, { startImmediately: true }),
+    );
+  });
+
+  const retainLocalWatcher = Effect.fn("VcsStatusBroadcaster.retainLocalWatcher")(function* (
+    cwd: string,
+  ) {
+    yield* SynchronizedRef.modifyEffect(localWatchersRef, (activeWatchers) => {
+      const existing = activeWatchers.get(cwd);
+      if (existing) {
+        const nextWatchers = new Map(activeWatchers);
+        nextWatchers.set(cwd, {
+          ...existing,
+          subscriberCount: existing.subscriberCount + 1,
+        });
+        return Effect.succeed([undefined, nextWatchers] as const);
+      }
+
+      return makeLocalWatcher(cwd).pipe(
+        Effect.map((fiber) => {
+          if (fiber === null) {
+            return [undefined, activeWatchers] as const;
+          }
+          const nextWatchers = new Map(activeWatchers);
+          nextWatchers.set(cwd, { fiber, subscriberCount: 1 });
+          return [undefined, nextWatchers] as const;
+        }),
+      );
+    });
+  });
+
+  const releaseLocalWatcher = Effect.fn("VcsStatusBroadcaster.releaseLocalWatcher")(function* (
+    cwd: string,
+  ) {
+    const watcherToInterrupt = yield* SynchronizedRef.modify(localWatchersRef, (activeWatchers) => {
+      const existing = activeWatchers.get(cwd);
+      if (!existing) {
+        return [null, activeWatchers] as const;
+      }
+      if (existing.subscriberCount > 1) {
+        const nextWatchers = new Map(activeWatchers);
+        nextWatchers.set(cwd, {
+          ...existing,
+          subscriberCount: existing.subscriberCount - 1,
+        });
+        return [null, nextWatchers] as const;
+      }
+      return [
+        existing.fiber,
+        new Map([...activeWatchers].filter(([activeCwd]) => activeCwd !== cwd)),
+      ] as const;
+    });
+
+    if (watcherToInterrupt) {
+      yield* Fiber.interrupt(watcherToInterrupt).pipe(Effect.ignore);
+    }
   });
 
   const refreshRemoteStatus = Effect.fn("VcsStatusBroadcaster.refreshRemoteStatus")(function* (
@@ -558,6 +660,7 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const cwd = yield* withFileSystem(normalizeCwd(input.cwd));
         const subscription = yield* PubSub.subscribe(changesPubSub);
+        yield* retainLocalWatcher(cwd);
         const initialLocal = yield* getOrLoadLocalStatus(cwd);
         const cachedStatus = yield* getCachedStatus(cwd);
         const initialRemote = cachedStatus?.remote?.value ?? null;
@@ -569,7 +672,10 @@ export const make = Effect.gen(function* () {
           cachedStatus?.remote === null || cachedStatus?.remote === undefined,
         );
 
-        const release = releaseRemotePoller(cwd, input.cwd).pipe(Effect.ignore, Effect.asVoid);
+        const release = Effect.all(
+          [releaseLocalWatcher(cwd), releaseRemotePoller(cwd, input.cwd)],
+          { concurrency: "unbounded", discard: true },
+        ).pipe(Effect.ignore, Effect.asVoid);
 
         return Stream.concat(
           Stream.make({
