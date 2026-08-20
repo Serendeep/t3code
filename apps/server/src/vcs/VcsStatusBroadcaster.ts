@@ -364,7 +364,7 @@ export const make = Effect.gen(function* () {
     return yield* refreshLocalStatusCore(cwd);
   });
 
-  const makeLocalWatcher = Effect.fn("VcsStatusBroadcaster.makeLocalWatcher")(function* (
+  const prepareLocalWatcher = Effect.fn("VcsStatusBroadcaster.prepareLocalWatcher")(function* (
     cwd: string,
   ) {
     const initialWatchPath = yield* workflow.localStatusWatchPath({ cwd }).pipe(Effect.result);
@@ -378,7 +378,7 @@ export const make = Effect.gen(function* () {
     );
     const watchPath = (rawHeadPath: string | null) => {
       if (rawHeadPath === null) {
-        return Effect.never;
+        return Effect.void;
       }
 
       const headPath = path.isAbsolute(rawHeadPath) ? rawHeadPath : path.resolve(cwd, rawHeadPath);
@@ -415,15 +415,36 @@ export const make = Effect.gen(function* () {
     });
     const nextWatchAttempt = workflow.localStatusWatchPath({ cwd }).pipe(Effect.flatMap(watchPath));
 
-    return yield* retryAfterFailure(firstWatchAttempt).pipe(
+    return retryAfterFailure(firstWatchAttempt).pipe(
       Effect.andThen(Effect.forever(retryAfterFailure(nextWatchAttempt))),
-      Effect.forkIn(broadcasterScope, { startImmediately: true }),
     );
   });
 
   const retainLocalWatcher = Effect.fn("VcsStatusBroadcaster.retainLocalWatcher")(function* (
     cwd: string,
   ) {
+    const retainedExisting = yield* SynchronizedRef.modify(localWatchersRef, (activeWatchers) => {
+      const existing = activeWatchers.get(cwd);
+      if (!existing) {
+        return [false, activeWatchers] as const;
+      }
+
+      const nextWatchers = new Map(activeWatchers);
+      nextWatchers.set(cwd, {
+        ...existing,
+        subscriberCount: existing.subscriberCount + 1,
+      });
+      return [true, nextWatchers] as const;
+    });
+    if (retainedExisting) {
+      return;
+    }
+
+    const watcher = yield* prepareLocalWatcher(cwd);
+    if (watcher === null) {
+      return;
+    }
+
     yield* SynchronizedRef.modifyEffect(localWatchersRef, (activeWatchers) => {
       const existing = activeWatchers.get(cwd);
       if (existing) {
@@ -435,11 +456,9 @@ export const make = Effect.gen(function* () {
         return Effect.succeed([undefined, nextWatchers] as const);
       }
 
-      return makeLocalWatcher(cwd).pipe(
+      return watcher.pipe(
+        Effect.forkIn(broadcasterScope, { startImmediately: true }),
         Effect.map((fiber) => {
-          if (fiber === null) {
-            return [undefined, activeWatchers] as const;
-          }
           const nextWatchers = new Map(activeWatchers);
           nextWatchers.set(cwd, { fiber, subscriberCount: 1 });
           return [undefined, nextWatchers] as const;
