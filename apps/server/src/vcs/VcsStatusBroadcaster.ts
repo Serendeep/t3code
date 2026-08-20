@@ -9,6 +9,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -366,49 +367,56 @@ export const make = Effect.gen(function* () {
   const makeLocalWatcher = Effect.fn("VcsStatusBroadcaster.makeLocalWatcher")(function* (
     cwd: string,
   ) {
-    const rawHeadPath = yield* workflow.localStatusWatchPath({ cwd }).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning("Failed to resolve the Git HEAD watch path", {
-          cwdLength: cwd.length,
-          failureTag: diagnosticValueTag(error),
-          failureOperation: diagnosticFailureOperation(error),
-        }).pipe(Effect.as(null)),
-      ),
-    );
-    if (rawHeadPath === null) {
+    const initialWatchPath = yield* workflow.localStatusWatchPath({ cwd }).pipe(Effect.result);
+    if (Result.isSuccess(initialWatchPath) && initialWatchPath.success === null) {
       return null;
     }
 
-    const headPath = path.isAbsolute(rawHeadPath) ? rawHeadPath : path.resolve(cwd, rawHeadPath);
-    const headDirectory = path.dirname(headPath);
-    const headFileName = path.basename(headPath);
     const refreshSafely = refreshLocalStatusCore(cwd).pipe(
       Effect.ignoreCause({ log: true }),
       Effect.asVoid,
     );
-    const headChanges = fs.watch(headDirectory).pipe(
-      Stream.filter((event) => {
-        return (
-          event.path === headPath ||
-          event.path === headFileName ||
-          path.resolve(headDirectory, event.path) === headPath
-        );
-      }),
-      Stream.debounce(Duration.millis(50)),
-    );
+    const watchPath = (rawHeadPath: string | null) => {
+      if (rawHeadPath === null) {
+        return Effect.never;
+      }
 
-    const watchUntilStopped = Stream.runForEach(headChanges, () => refreshSafely).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning("Git HEAD watcher stopped; restarting", {
-          cwdLength: cwd.length,
-          failureTag: diagnosticValueTag(error),
-          failureOperation: diagnosticFailureOperation(error),
-        }),
-      ),
-      Effect.andThen(Effect.sleep(LOCAL_WATCH_RESTART_DELAY)),
-    );
+      const headPath = path.isAbsolute(rawHeadPath) ? rawHeadPath : path.resolve(cwd, rawHeadPath);
+      const headDirectory = path.dirname(headPath);
+      const headFileName = path.basename(headPath);
+      return Stream.runForEach(
+        fs.watch(headDirectory).pipe(
+          Stream.filter((event) => {
+            return (
+              event.path === headPath ||
+              event.path === headFileName ||
+              path.resolve(headDirectory, event.path) === headPath
+            );
+          }),
+          Stream.debounce(Duration.millis(50)),
+        ),
+        () => refreshSafely,
+      );
+    };
+    const retryAfterFailure = <A, R>(effect: Effect.Effect<A, unknown, R>) =>
+      effect.pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("Git HEAD watcher failed; restarting", {
+            cwdLength: cwd.length,
+            failureTag: diagnosticValueTag(error),
+            failureOperation: diagnosticFailureOperation(error),
+          }),
+        ),
+        Effect.andThen(Effect.sleep(LOCAL_WATCH_RESTART_DELAY)),
+      );
+    const firstWatchAttempt = Result.match(initialWatchPath, {
+      onFailure: Effect.fail,
+      onSuccess: watchPath,
+    });
+    const nextWatchAttempt = workflow.localStatusWatchPath({ cwd }).pipe(Effect.flatMap(watchPath));
 
-    return yield* Effect.forever(watchUntilStopped).pipe(
+    return yield* retryAfterFailure(firstWatchAttempt).pipe(
+      Effect.andThen(Effect.forever(retryAfterFailure(nextWatchAttempt))),
       Effect.forkIn(broadcasterScope, { startImmediately: true }),
     );
   });

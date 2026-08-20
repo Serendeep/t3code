@@ -80,6 +80,9 @@ function makeTestLayer(
     remoteStatusRefreshUpstreamValues?: Array<boolean | undefined>;
     headPath?: string | null;
     localStatusWatchPathCalls?: number;
+    localStatusWatchPathFailuresRemaining?: number;
+    firstLocalStatusWatchPathAttempt?: Deferred.Deferred<void>;
+    secondLocalStatusWatchPathAttempt?: Deferred.Deferred<void>;
     localStatusFailuresRemaining?: number;
   },
   fileSystem?: FileSystem.FileSystem,
@@ -89,8 +92,33 @@ function makeTestLayer(
     Layer.provide(
       Layer.mock(GitWorkflowService.GitWorkflowService)({
         localStatusWatchPath: () =>
-          Effect.sync(() => {
+          Effect.gen(function* () {
             state.localStatusWatchPathCalls = (state.localStatusWatchPathCalls ?? 0) + 1;
+            if (state.localStatusWatchPathCalls === 1) {
+              yield* state.firstLocalStatusWatchPathAttempt
+                ? Deferred.succeed(state.firstLocalStatusWatchPathAttempt, undefined).pipe(
+                    Effect.ignore,
+                  )
+                : Effect.void;
+            }
+            if (state.localStatusWatchPathCalls === 2) {
+              yield* state.secondLocalStatusWatchPathAttempt
+                ? Deferred.succeed(state.secondLocalStatusWatchPathAttempt, undefined).pipe(
+                    Effect.ignore,
+                  )
+                : Effect.void;
+            }
+            if ((state.localStatusWatchPathFailuresRemaining ?? 0) > 0) {
+              state.localStatusWatchPathFailuresRemaining =
+                (state.localStatusWatchPathFailuresRemaining ?? 0) - 1;
+              return yield* Effect.fail(
+                new GitManagerError({
+                  operation: "VcsStatusBroadcaster.test.localStatusWatchPath",
+                  cwd: "/repo",
+                  detail: "HEAD path resolution failed",
+                }),
+              );
+            }
             return state.headPath ?? null;
           }),
         localStatus: () =>
@@ -613,6 +641,84 @@ describe("VcsStatusBroadcaster", () => {
         yield* fileSystem.writeFileString(
           headPath,
           "ref: refs/heads/feature/after-watch-restart\n",
+        );
+
+        const localUpdated = yield* Deferred.await(localUpdatedDeferred);
+        assert.deepStrictEqual(localUpdated, {
+          _tag: "localUpdated",
+          local: state.currentLocalStatus,
+        } satisfies VcsStatusStreamEvent);
+      });
+
+      yield* program.pipe(Effect.provide(makeTestLayer(state, testFileSystem)));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("retries HEAD path resolution after a transient failure", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-vcs-status-watch-path-retry-",
+      });
+      const gitDirectory = `${cwd}/.git`;
+      const headPath = `${gitDirectory}/HEAD`;
+      yield* fileSystem.makeDirectory(gitDirectory);
+      yield* fileSystem.writeFileString(headPath, "ref: refs/heads/main\n");
+
+      const firstWatchPathAttempt = yield* Deferred.make<void>();
+      const secondWatchPathAttempt = yield* Deferred.make<void>();
+      const watcherStarted = yield* Deferred.make<void>();
+      const testFileSystem: FileSystem.FileSystem = {
+        ...fileSystem,
+        watch: (watchPath) =>
+          Stream.unwrap(
+            Deferred.succeed(watcherStarted, undefined).pipe(
+              Effect.ignore,
+              Effect.as(fileSystem.watch(watchPath)),
+            ),
+          ),
+      };
+      const state = {
+        currentLocalStatus: baseLocalStatus,
+        currentRemoteStatus: baseRemoteStatus,
+        localStatusCalls: 0,
+        remoteStatusCalls: 0,
+        localInvalidationCalls: 0,
+        remoteInvalidationCalls: 0,
+        headPath,
+        localStatusWatchPathCalls: 0,
+        localStatusWatchPathFailuresRemaining: 1,
+        firstLocalStatusWatchPathAttempt: firstWatchPathAttempt,
+        secondLocalStatusWatchPathAttempt: secondWatchPathAttempt,
+      };
+
+      const program = Effect.gen(function* () {
+        const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+        const snapshotDeferred = yield* Deferred.make<VcsStatusStreamEvent>();
+        const localUpdatedDeferred = yield* Deferred.make<VcsStatusStreamEvent>();
+        yield* Stream.runForEach(broadcaster.streamStatus({ cwd }), (event) => {
+          if (event._tag === "snapshot") {
+            return Deferred.succeed(snapshotDeferred, event).pipe(Effect.ignore);
+          }
+          if (event._tag === "localUpdated") {
+            return Deferred.succeed(localUpdatedDeferred, event).pipe(Effect.ignore);
+          }
+          return Effect.void;
+        }).pipe(Effect.forkScoped);
+
+        yield* Deferred.await(snapshotDeferred);
+        yield* Deferred.await(firstWatchPathAttempt);
+        yield* Deferred.await(secondWatchPathAttempt);
+        yield* Deferred.await(watcherStarted);
+        assert.equal(state.localStatusWatchPathCalls, 2);
+
+        state.currentLocalStatus = {
+          ...baseLocalStatus,
+          refName: "feature/after-watch-path-retry",
+        };
+        yield* fileSystem.writeFileString(
+          headPath,
+          "ref: refs/heads/feature/after-watch-path-retry\n",
         );
 
         const localUpdated = yield* Deferred.await(localUpdatedDeferred);
