@@ -84,6 +84,8 @@ function makeTestLayer(
     firstLocalStatusWatchPathAttempt?: Deferred.Deferred<void>;
     secondLocalStatusWatchPathAttempt?: Deferred.Deferred<void>;
     localStatusFailuresRemaining?: number;
+    localStatusStarted?: Deferred.Deferred<void>;
+    releaseLocalStatus?: Deferred.Deferred<void>;
   },
   fileSystem?: FileSystem.FileSystem,
 ) {
@@ -122,11 +124,11 @@ function makeTestLayer(
             return state.headPath ?? null;
           }),
         localStatus: () =>
-          Effect.suspend(() => {
+          Effect.gen(function* () {
             state.localStatusCalls += 1;
             if ((state.localStatusFailuresRemaining ?? 0) > 0) {
               state.localStatusFailuresRemaining = (state.localStatusFailuresRemaining ?? 0) - 1;
-              return Effect.fail(
+              return yield* Effect.fail(
                 new GitManagerError({
                   operation: "VcsStatusBroadcaster.test.localStatus",
                   cwd: "/repo",
@@ -134,7 +136,13 @@ function makeTestLayer(
                 }),
               );
             }
-            return Effect.succeed(state.currentLocalStatus);
+            if (state.localStatusStarted) {
+              yield* Deferred.succeed(state.localStatusStarted, undefined).pipe(Effect.ignore);
+            }
+            if (state.releaseLocalStatus) {
+              yield* Deferred.await(state.releaseLocalStatus);
+            }
+            return state.currentLocalStatus;
           }),
         remoteStatus: (_input, options) =>
           Effect.sync(() => {
@@ -477,6 +485,74 @@ describe("VcsStatusBroadcaster", () => {
     }).pipe(Effect.provide(makeTestLayer(state)));
   });
 
+  it.live("loads the initial local status before starting the HEAD watcher", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-vcs-status-initial-load-",
+      });
+      const gitDirectory = `${cwd}/.git`;
+      const headPath = `${gitDirectory}/HEAD`;
+      yield* fileSystem.makeDirectory(gitDirectory);
+      yield* fileSystem.writeFileString(headPath, "ref: refs/heads/main\n");
+
+      const localStatusStarted = yield* Deferred.make<void>();
+      const releaseLocalStatus = yield* Deferred.make<void>();
+      const watcherStarted = yield* Deferred.make<void>();
+      const testFileSystem: FileSystem.FileSystem = {
+        ...fileSystem,
+        watch: () =>
+          Stream.unwrap(
+            Deferred.succeed(watcherStarted, undefined).pipe(
+              Effect.ignore,
+              Effect.as(Stream.never),
+            ),
+          ),
+      };
+      const state = {
+        currentLocalStatus: baseLocalStatus,
+        currentRemoteStatus: baseRemoteStatus,
+        localStatusCalls: 0,
+        remoteStatusCalls: 0,
+        localInvalidationCalls: 0,
+        remoteInvalidationCalls: 0,
+        headPath,
+        localStatusStarted,
+        releaseLocalStatus,
+      };
+
+      const program = Effect.gen(function* () {
+        const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+        const snapshotDeferred = yield* Deferred.make<VcsStatusStreamEvent>();
+        yield* Stream.runForEach(broadcaster.streamStatus({ cwd }), (event) => {
+          return event._tag === "snapshot"
+            ? Deferred.succeed(snapshotDeferred, event).pipe(Effect.ignore)
+            : Effect.void;
+        }).pipe(Effect.forkScoped);
+
+        yield* Deferred.await(localStatusStarted);
+        const watcherBeforeLoad = yield* Deferred.poll(watcherStarted);
+        assert.isTrue(Option.isNone(watcherBeforeLoad));
+
+        state.currentLocalStatus = {
+          ...baseLocalStatus,
+          refName: "feature/during-initial-load",
+        };
+        yield* Deferred.succeed(releaseLocalStatus, undefined);
+
+        yield* Deferred.await(watcherStarted);
+        const snapshot = yield* Deferred.await(snapshotDeferred);
+        assert.deepStrictEqual(snapshot, {
+          _tag: "snapshot",
+          local: state.currentLocalStatus,
+          remote: null,
+        } satisfies VcsStatusStreamEvent);
+      });
+
+      yield* program.pipe(Effect.provide(makeTestLayer(state, testFileSystem)));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.live("streams a branch change made outside the VCS actions", () => {
     const state = {
       currentLocalStatus: baseLocalStatus,
@@ -532,7 +608,7 @@ describe("VcsStatusBroadcaster", () => {
     }).pipe(Effect.provide(makeTestLayer(state)));
   });
 
-  it.live("releases the local watcher when stream setup fails", () => {
+  it.live("does not retain the local watcher when the initial local load fails", () => {
     const state = {
       currentLocalStatus: baseLocalStatus,
       currentRemoteStatus: baseRemoteStatus,
@@ -558,11 +634,11 @@ describe("VcsStatusBroadcaster", () => {
       const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
       const failure = yield* Stream.runHead(broadcaster.streamStatus({ cwd })).pipe(Effect.flip);
       assert.instanceOf(failure, GitManagerError);
-      assert.equal(state.localStatusWatchPathCalls, 1);
+      assert.equal(state.localStatusWatchPathCalls, 0);
 
       const snapshot = yield* Stream.runHead(broadcaster.streamStatus({ cwd }));
       assert.isTrue(Option.isSome(snapshot));
-      assert.equal(state.localStatusWatchPathCalls, 2);
+      assert.equal(state.localStatusWatchPathCalls, 1);
     }).pipe(Effect.provide(makeTestLayer(state)));
   });
 

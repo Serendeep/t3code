@@ -679,8 +679,8 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const cwd = yield* withFileSystem(normalizeCwd(input.cwd));
         const subscription = yield* PubSub.subscribe(changesPubSub);
-        yield* Effect.acquireRelease(retainLocalWatcher(cwd), () => releaseLocalWatcher(cwd));
         const initialLocal = yield* getOrLoadLocalStatus(cwd);
+        yield* Effect.acquireRelease(retainLocalWatcher(cwd), () => releaseLocalWatcher(cwd));
         const cachedStatus = yield* getCachedStatus(cwd);
         const initialRemote = cachedStatus?.remote?.value ?? null;
         yield* Effect.acquireRelease(
