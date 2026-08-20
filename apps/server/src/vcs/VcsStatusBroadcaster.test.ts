@@ -1,4 +1,5 @@
 import { assert, it, describe } from "@effect/vitest";
+import * as NodePath from "@effect/platform-node/NodePath";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -11,6 +12,7 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -67,19 +69,22 @@ const baseStatus: VcsStatusResult = {
   ...baseRemoteStatus,
 };
 
-function makeTestLayer(state: {
-  currentLocalStatus: VcsStatusLocalResult;
-  currentRemoteStatus: VcsStatusRemoteResult | null;
-  localStatusCalls: number;
-  remoteStatusCalls: number;
-  localInvalidationCalls: number;
-  remoteInvalidationCalls: number;
-  remoteStatusRefreshUpstreamValues?: Array<boolean | undefined>;
-  headPath?: string | null;
-  localStatusWatchPathCalls?: number;
-}) {
-  return VcsStatusBroadcaster.layer.pipe(
-    Layer.provideMerge(NodeServices.layer),
+function makeTestLayer(
+  state: {
+    currentLocalStatus: VcsStatusLocalResult;
+    currentRemoteStatus: VcsStatusRemoteResult | null;
+    localStatusCalls: number;
+    remoteStatusCalls: number;
+    localInvalidationCalls: number;
+    remoteInvalidationCalls: number;
+    remoteStatusRefreshUpstreamValues?: Array<boolean | undefined>;
+    headPath?: string | null;
+    localStatusWatchPathCalls?: number;
+    localStatusFailuresRemaining?: number;
+  },
+  fileSystem?: FileSystem.FileSystem,
+) {
+  const serviceLayer = VcsStatusBroadcaster.layer.pipe(
     Layer.provide(makeBackgroundPolicyLayer(() => true)),
     Layer.provide(
       Layer.mock(GitWorkflowService.GitWorkflowService)({
@@ -89,9 +94,19 @@ function makeTestLayer(state: {
             return state.headPath ?? null;
           }),
         localStatus: () =>
-          Effect.sync(() => {
+          Effect.suspend(() => {
             state.localStatusCalls += 1;
-            return state.currentLocalStatus;
+            if ((state.localStatusFailuresRemaining ?? 0) > 0) {
+              state.localStatusFailuresRemaining = (state.localStatusFailuresRemaining ?? 0) - 1;
+              return Effect.fail(
+                new GitManagerError({
+                  operation: "VcsStatusBroadcaster.test.localStatus",
+                  cwd: "/repo",
+                  detail: "local status failed",
+                }),
+              );
+            }
+            return Effect.succeed(state.currentLocalStatus);
           }),
         remoteStatus: (_input, options) =>
           Effect.sync(() => {
@@ -115,6 +130,13 @@ function makeTestLayer(state: {
       }),
     ),
   );
+
+  return fileSystem
+    ? serviceLayer.pipe(
+        Layer.provideMerge(Layer.succeed(FileSystem.FileSystem, fileSystem)),
+        Layer.provideMerge(NodePath.layer),
+      )
+    : serviceLayer.pipe(Layer.provideMerge(NodeServices.layer));
 }
 
 function makeBackgroundPolicyLayer(shouldRunScopeWork: (scope: BackgroundScope) => boolean) {
@@ -481,6 +503,128 @@ describe("VcsStatusBroadcaster", () => {
       } satisfies VcsStatusStreamEvent);
     }).pipe(Effect.provide(makeTestLayer(state)));
   });
+
+  it.live("releases the local watcher when stream setup fails", () => {
+    const state = {
+      currentLocalStatus: baseLocalStatus,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+      headPath: null as string | null,
+      localStatusWatchPathCalls: 0,
+      localStatusFailuresRemaining: 1,
+    };
+
+    return Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-vcs-status-setup-failure-",
+      });
+      const gitDirectory = `${cwd}/.git`;
+      state.headPath = `${gitDirectory}/HEAD`;
+      yield* fileSystem.makeDirectory(gitDirectory);
+      yield* fileSystem.writeFileString(`${gitDirectory}/HEAD`, "ref: refs/heads/main\n");
+
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      const failure = yield* Stream.runHead(broadcaster.streamStatus({ cwd })).pipe(Effect.flip);
+      assert.instanceOf(failure, GitManagerError);
+      assert.equal(state.localStatusWatchPathCalls, 1);
+
+      const snapshot = yield* Stream.runHead(broadcaster.streamStatus({ cwd }));
+      assert.isTrue(Option.isSome(snapshot));
+      assert.equal(state.localStatusWatchPathCalls, 2);
+    }).pipe(Effect.provide(makeTestLayer(state)));
+  });
+
+  it.live("restarts the local watcher after a filesystem watch failure", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-vcs-status-watch-restart-",
+      });
+      const gitDirectory = `${cwd}/.git`;
+      const headPath = `${gitDirectory}/HEAD`;
+      yield* fileSystem.makeDirectory(gitDirectory);
+      yield* fileSystem.writeFileString(headPath, "ref: refs/heads/main\n");
+
+      let watchCalls = 0;
+      const firstWatchAttempt = yield* Deferred.make<void>();
+      const secondWatchAttempt = yield* Deferred.make<void>();
+      const testFileSystem: FileSystem.FileSystem = {
+        ...fileSystem,
+        watch: (watchPath) =>
+          Stream.unwrap(
+            Effect.gen(function* () {
+              watchCalls += 1;
+              if (watchCalls === 1) {
+                yield* Deferred.succeed(firstWatchAttempt, undefined).pipe(Effect.ignore);
+                return Stream.fail(
+                  PlatformError.systemError({
+                    _tag: "PermissionDenied",
+                    module: "FileSystem",
+                    method: "watch",
+                    pathOrDescriptor: String(watchPath),
+                    description: "Transient watch failure for the regression test.",
+                  }),
+                );
+              }
+              yield* Deferred.succeed(secondWatchAttempt, undefined).pipe(Effect.ignore);
+              return fileSystem.watch(watchPath);
+            }),
+          ),
+      };
+      const state = {
+        currentLocalStatus: baseLocalStatus,
+        currentRemoteStatus: baseRemoteStatus,
+        localStatusCalls: 0,
+        remoteStatusCalls: 0,
+        localInvalidationCalls: 0,
+        remoteInvalidationCalls: 0,
+        headPath,
+        localStatusWatchPathCalls: 0,
+      };
+
+      const program = Effect.gen(function* () {
+        const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+        const snapshotDeferred = yield* Deferred.make<VcsStatusStreamEvent>();
+        const localUpdatedDeferred = yield* Deferred.make<VcsStatusStreamEvent>();
+        yield* Stream.runForEach(broadcaster.streamStatus({ cwd }), (event) => {
+          if (event._tag === "snapshot") {
+            return Deferred.succeed(snapshotDeferred, event).pipe(Effect.ignore);
+          }
+          if (event._tag === "localUpdated") {
+            return Deferred.succeed(localUpdatedDeferred, event).pipe(Effect.ignore);
+          }
+          return Effect.void;
+        }).pipe(Effect.forkScoped);
+
+        yield* Deferred.await(snapshotDeferred);
+        yield* Deferred.await(firstWatchAttempt);
+        assert.equal(watchCalls, 1);
+        yield* Deferred.await(secondWatchAttempt);
+        assert.equal(watchCalls, 2);
+
+        state.currentLocalStatus = {
+          ...baseLocalStatus,
+          refName: "feature/after-watch-restart",
+        };
+        yield* fileSystem.writeFileString(
+          headPath,
+          "ref: refs/heads/feature/after-watch-restart\n",
+        );
+
+        const localUpdated = yield* Deferred.await(localUpdatedDeferred);
+        assert.deepStrictEqual(localUpdated, {
+          _tag: "localUpdated",
+          local: state.currentLocalStatus,
+        } satisfies VcsStatusStreamEvent);
+      });
+
+      yield* program.pipe(Effect.provide(makeTestLayer(state, testFileSystem)));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 
   it.effect("loads remote status once when periodic refreshes are disabled", () => {
     const state = {

@@ -27,6 +27,7 @@ import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 
 const DEFAULT_VCS_STATUS_REFRESH_INTERVAL = Duration.seconds(30);
+const LOCAL_WATCH_RESTART_DELAY = Duration.seconds(1);
 const VCS_STATUS_REFRESH_FAILURE_BASE_DELAY = Duration.seconds(30);
 const VCS_STATUS_REFRESH_FAILURE_MAX_DELAY = Duration.minutes(15);
 const MAX_FAILURE_DIAGNOSTIC_VALUES = 8;
@@ -396,8 +397,18 @@ export const make = Effect.gen(function* () {
       Stream.debounce(Duration.millis(50)),
     );
 
-    return yield* Stream.runForEach(headChanges, () => refreshSafely).pipe(
-      Effect.ignoreCause({ log: true }),
+    const watchUntilStopped = Stream.runForEach(headChanges, () => refreshSafely).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Git HEAD watcher stopped; restarting", {
+          cwdLength: cwd.length,
+          failureTag: diagnosticValueTag(error),
+          failureOperation: diagnosticFailureOperation(error),
+        }),
+      ),
+      Effect.andThen(Effect.sleep(LOCAL_WATCH_RESTART_DELAY)),
+    );
+
+    return yield* Effect.forever(watchUntilStopped).pipe(
       Effect.forkIn(broadcasterScope, { startImmediately: true }),
     );
   });
@@ -660,22 +671,20 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const cwd = yield* withFileSystem(normalizeCwd(input.cwd));
         const subscription = yield* PubSub.subscribe(changesPubSub);
-        yield* retainLocalWatcher(cwd);
+        yield* Effect.acquireRelease(retainLocalWatcher(cwd), () => releaseLocalWatcher(cwd));
         const initialLocal = yield* getOrLoadLocalStatus(cwd);
         const cachedStatus = yield* getCachedStatus(cwd);
         const initialRemote = cachedStatus?.remote?.value ?? null;
-        yield* retainRemotePoller(
-          cwd,
-          input.cwd,
-          options?.automaticRemoteRefreshInterval ??
-            Effect.succeed(DEFAULT_VCS_STATUS_REFRESH_INTERVAL),
-          cachedStatus?.remote === null || cachedStatus?.remote === undefined,
+        yield* Effect.acquireRelease(
+          retainRemotePoller(
+            cwd,
+            input.cwd,
+            options?.automaticRemoteRefreshInterval ??
+              Effect.succeed(DEFAULT_VCS_STATUS_REFRESH_INTERVAL),
+            cachedStatus?.remote === null || cachedStatus?.remote === undefined,
+          ),
+          () => releaseRemotePoller(cwd, input.cwd),
         );
-
-        const release = Effect.all(
-          [releaseLocalWatcher(cwd), releaseRemotePoller(cwd, input.cwd)],
-          { concurrency: "unbounded", discard: true },
-        ).pipe(Effect.ignore, Effect.asVoid);
 
         return Stream.concat(
           Stream.make({
@@ -687,7 +696,7 @@ export const make = Effect.gen(function* () {
             Stream.filter((event) => event.cwd === cwd),
             Stream.map((event) => event.event),
           ),
-        ).pipe(Stream.ensuring(release));
+        );
       }),
     );
 
