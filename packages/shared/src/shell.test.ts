@@ -136,10 +136,10 @@ describe("readEnvironmentFromLoginShell", () => {
     });
 
     const command = execFile.mock.calls[0]?.[1][1];
-    expect(command).toContain("do --ignore-errors { printenv PATH }");
+    expect(command).toBe(
+      "print '__T3CODE_ENV_PATH_START__'; try { printenv PATH } catch { print '' }; print '__T3CODE_ENV_PATH_END__'",
+    );
     expect(command).not.toContain("|| true");
-    expect(command).toContain("__T3CODE_ENV_PATH_START__");
-    expect(command).toContain("__T3CODE_ENV_PATH_END__");
   });
 
   it("extracts multiple environment variables from a login shell command", () => {

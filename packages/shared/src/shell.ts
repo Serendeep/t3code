@@ -259,13 +259,17 @@ function buildEnvironmentCaptureCommand(shell: string, names: ReadonlyArray<stri
         throw new Error(`Unsupported environment variable name: ${name}`);
       }
 
-      const readVariable = isNushell
-        ? `do --ignore-errors { printenv ${name} }`
-        : `printenv ${name} || true`;
+      if (isNushell) {
+        return [
+          `print '${envCaptureStart(name)}'`,
+          `try { printenv ${name} } catch { print '' }`,
+          `print '${envCaptureEnd(name)}'`,
+        ].join("; ");
+      }
 
       return [
         `printf '%s\\n' '${envCaptureStart(name)}'`,
-        readVariable,
+        `printenv ${name} || true`,
         `printf '%s\\n' '${envCaptureEnd(name)}'`,
       ].join("; ");
     })
