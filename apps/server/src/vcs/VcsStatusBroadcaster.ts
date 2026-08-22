@@ -29,6 +29,7 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 
 const DEFAULT_VCS_STATUS_REFRESH_INTERVAL = Duration.seconds(30);
 const LOCAL_WATCH_RESTART_DELAY = Duration.seconds(1);
+const LOCAL_WATCH_MAX_RESTART_DELAY = Duration.seconds(30);
 const VCS_STATUS_REFRESH_FAILURE_BASE_DELAY = Duration.seconds(30);
 const VCS_STATUS_REFRESH_FAILURE_MAX_DELAY = Duration.minutes(15);
 const MAX_FAILURE_DIAGNOSTIC_VALUES = 8;
@@ -376,15 +377,17 @@ export const make = Effect.gen(function* () {
       Effect.ignoreCause({ log: true }),
       Effect.asVoid,
     );
-    const watchPath = (rawHeadPath: string | null) => {
+    const watchPath = Effect.fn("VcsStatusBroadcaster.watchLocalStatusPath")(function* (
+      rawHeadPath: string | null,
+    ) {
       if (rawHeadPath === null) {
-        return Effect.void;
+        return;
       }
 
       const headPath = path.isAbsolute(rawHeadPath) ? rawHeadPath : path.resolve(cwd, rawHeadPath);
       const headDirectory = path.dirname(headPath);
       const headFileName = path.basename(headPath);
-      return Stream.runForEach(
+      yield* Stream.runForEach(
         fs.watch(headDirectory).pipe(
           Stream.filter((event) => {
             return (
@@ -397,9 +400,12 @@ export const make = Effect.gen(function* () {
         ),
         () => refreshSafely,
       );
-    };
-    const retryAfterFailure = <A, R>(effect: Effect.Effect<A, unknown, R>) =>
-      effect.pipe(
+    });
+    const runWatchAttempt = Effect.fn("VcsStatusBroadcaster.runLocalStatusWatchAttempt")(function* <
+      E,
+      R,
+    >(attempt: Effect.Effect<void, E, R>) {
+      yield* attempt.pipe(
         Effect.catch((error) =>
           Effect.logWarning("Git HEAD watcher failed; restarting", {
             cwdLength: cwd.length,
@@ -407,17 +413,20 @@ export const make = Effect.gen(function* () {
             failureOperation: diagnosticFailureOperation(error),
           }),
         ),
-        Effect.andThen(Effect.sleep(LOCAL_WATCH_RESTART_DELAY)),
       );
-    const firstWatchAttempt = Result.match(initialWatchPath, {
-      onFailure: Effect.fail,
-      onSuccess: watchPath,
     });
+    const firstWatchAttempt = Effect.fromResult(initialWatchPath).pipe(Effect.flatMap(watchPath));
     const nextWatchAttempt = workflow.localStatusWatchPath({ cwd }).pipe(Effect.flatMap(watchPath));
 
-    return retryAfterFailure(firstWatchAttempt).pipe(
-      Effect.andThen(Effect.forever(retryAfterFailure(nextWatchAttempt))),
-    );
+    return Effect.gen(function* () {
+      yield* runWatchAttempt(firstWatchAttempt);
+      let restartDelay = LOCAL_WATCH_RESTART_DELAY;
+      while (true) {
+        yield* Effect.sleep(restartDelay);
+        yield* runWatchAttempt(nextWatchAttempt);
+        restartDelay = Duration.min(Duration.times(restartDelay, 2), LOCAL_WATCH_MAX_RESTART_DELAY);
+      }
+    });
   });
 
   const retainLocalWatcher = Effect.fn("VcsStatusBroadcaster.retainLocalWatcher")(function* (
@@ -437,15 +446,15 @@ export const make = Effect.gen(function* () {
       return [true, nextWatchers] as const;
     });
     if (retainedExisting) {
-      return;
+      return false;
     }
 
     const watcher = yield* prepareLocalWatcher(cwd);
     if (watcher === null) {
-      return;
+      return false;
     }
 
-    yield* SynchronizedRef.modifyEffect(localWatchersRef, (activeWatchers) => {
+    return yield* SynchronizedRef.modifyEffect(localWatchersRef, (activeWatchers) => {
       const existing = activeWatchers.get(cwd);
       if (existing) {
         const nextWatchers = new Map(activeWatchers);
@@ -453,7 +462,7 @@ export const make = Effect.gen(function* () {
           ...existing,
           subscriberCount: existing.subscriberCount + 1,
         });
-        return Effect.succeed([undefined, nextWatchers] as const);
+        return Effect.succeed([false, nextWatchers] as const);
       }
 
       return watcher.pipe(
@@ -461,7 +470,7 @@ export const make = Effect.gen(function* () {
         Effect.map((fiber) => {
           const nextWatchers = new Map(activeWatchers);
           nextWatchers.set(cwd, { fiber, subscriberCount: 1 });
-          return [undefined, nextWatchers] as const;
+          return [true, nextWatchers] as const;
         }),
       );
     });
@@ -698,8 +707,13 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const cwd = yield* withFileSystem(normalizeCwd(input.cwd));
         const subscription = yield* PubSub.subscribe(changesPubSub);
-        const initialLocal = yield* getOrLoadLocalStatus(cwd);
-        yield* Effect.acquireRelease(retainLocalWatcher(cwd), () => releaseLocalWatcher(cwd));
+        let initialLocal = yield* getOrLoadLocalStatus(cwd);
+        const startedLocalWatcher = yield* Effect.acquireRelease(retainLocalWatcher(cwd), () =>
+          releaseLocalWatcher(cwd),
+        );
+        if (startedLocalWatcher) {
+          initialLocal = yield* loadLocalStatus(cwd);
+        }
         const cachedStatus = yield* getCachedStatus(cwd);
         const initialRemote = cachedStatus?.remote?.value ?? null;
         yield* Effect.acquireRelease(
