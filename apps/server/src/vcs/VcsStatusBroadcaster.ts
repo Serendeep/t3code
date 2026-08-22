@@ -446,7 +446,7 @@ export const make = Effect.gen(function* () {
       return [true, nextWatchers] as const;
     });
     if (retainedExisting) {
-      return false;
+      return true;
     }
 
     const watcher = yield* prepareLocalWatcher(cwd);
@@ -462,7 +462,7 @@ export const make = Effect.gen(function* () {
           ...existing,
           subscriberCount: existing.subscriberCount + 1,
         });
-        return Effect.succeed([false, nextWatchers] as const);
+        return Effect.succeed([true, nextWatchers] as const);
       }
 
       return watcher.pipe(
@@ -708,10 +708,11 @@ export const make = Effect.gen(function* () {
         const cwd = yield* withFileSystem(normalizeCwd(input.cwd));
         const subscription = yield* PubSub.subscribe(changesPubSub);
         let initialLocal = yield* getOrLoadLocalStatus(cwd);
-        const startedLocalWatcher = yield* Effect.acquireRelease(retainLocalWatcher(cwd), () =>
+        const retainedLocalWatcher = yield* Effect.acquireRelease(retainLocalWatcher(cwd), () =>
           releaseLocalWatcher(cwd),
         );
-        if (startedLocalWatcher) {
+        if (retainedLocalWatcher) {
+          yield* workflow.invalidateLocalStatus(cwd);
           initialLocal = yield* loadLocalStatus(cwd);
         }
         const cachedStatus = yield* getCachedStatus(cwd);

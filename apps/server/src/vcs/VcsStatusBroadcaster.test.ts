@@ -532,6 +532,7 @@ describe("VcsStatusBroadcaster", () => {
         refName: "feature/during-watch-handoff",
       };
       let localStatusCalls = 0;
+      let localStatusInvalidated = false;
       const watchEvents = yield* Queue.unbounded<FileSystem.WatchEvent>();
       const testFileSystem: FileSystem.FileSystem = {
         ...fileSystem,
@@ -547,10 +548,13 @@ describe("VcsStatusBroadcaster", () => {
             localStatus: () =>
               Effect.sync(() => {
                 localStatusCalls += 1;
-                return localStatusCalls === 1 ? baseLocalStatus : switchedLocalStatus;
+                return localStatusInvalidated ? switchedLocalStatus : baseLocalStatus;
               }),
             remoteStatus: () => Effect.succeed(baseRemoteStatus),
-            invalidateLocalStatus: () => Effect.void,
+            invalidateLocalStatus: () =>
+              Effect.sync(() => {
+                localStatusInvalidated = true;
+              }),
             invalidateRemoteStatus: () => Effect.void,
             invalidateStatus: () => Effect.void,
           }),
@@ -573,6 +577,68 @@ describe("VcsStatusBroadcaster", () => {
         } satisfies VcsStatusStreamEvent),
       );
       assert.equal(localStatusCalls, 2);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("reconciles local status when joining an existing HEAD watcher", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const cwd = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-vcs-status-watch-joiner-",
+      });
+      const gitDirectory = `${cwd}/.git`;
+      const headPath = `${gitDirectory}/HEAD`;
+      yield* fileSystem.makeDirectory(gitDirectory);
+      yield* fileSystem.writeFileString(headPath, "ref: refs/heads/main\n");
+
+      const testFileSystem: FileSystem.FileSystem = {
+        ...fileSystem,
+        watch: () => Stream.never,
+      };
+      const state = {
+        currentLocalStatus: baseLocalStatus,
+        currentRemoteStatus: baseRemoteStatus,
+        localStatusCalls: 0,
+        remoteStatusCalls: 0,
+        localInvalidationCalls: 0,
+        remoteInvalidationCalls: 0,
+      };
+
+      const program = Effect.gen(function* () {
+        const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+        const firstSnapshot = yield* Deferred.make<VcsStatusStreamEvent>();
+        yield* Stream.runForEach(broadcaster.streamStatus({ cwd }), (event) => {
+          return event._tag === "snapshot"
+            ? Deferred.succeed(firstSnapshot, event).pipe(Effect.ignore)
+            : Effect.void;
+        }).pipe(Effect.forkScoped);
+        yield* Deferred.await(firstSnapshot);
+
+        state.currentLocalStatus = {
+          ...baseLocalStatus,
+          refName: "feature/before-joiner-handoff",
+        };
+        const joinerSnapshot = yield* Stream.runHead(broadcaster.streamStatus({ cwd }));
+
+        assert.deepStrictEqual(
+          joinerSnapshot,
+          Option.some({
+            _tag: "snapshot",
+            local: state.currentLocalStatus,
+            remote: baseRemoteStatus,
+          } satisfies VcsStatusStreamEvent),
+        );
+        assert.equal(state.localStatusCalls, 3);
+        assert.equal(state.localInvalidationCalls, 2);
+      });
+
+      yield* program.pipe(
+        Effect.provide(
+          makeTestLayer(state, testFileSystem, {
+            localStatusWatchPath: () => Effect.succeed(headPath),
+          }),
+        ),
+      );
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
