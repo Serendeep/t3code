@@ -122,6 +122,26 @@ describe("readPathFromLaunchctl", () => {
 });
 
 describe("readEnvironmentFromLoginShell", () => {
+  it("uses Nushell-compatible syntax for a nu login shell", () => {
+    const execFile = vi.fn<
+      (
+        file: string,
+        args: ReadonlyArray<string>,
+        options: { encoding: "utf8"; timeout: number },
+      ) => string
+    >(() => "__T3CODE_ENV_PATH_START__\n/a:/b\n__T3CODE_ENV_PATH_END__\n");
+
+    expect(readEnvironmentFromLoginShell("/opt/homebrew/bin/nu", ["PATH"], execFile)).toEqual({
+      PATH: "/a:/b",
+    });
+
+    const command = execFile.mock.calls[0]?.[1][1];
+    expect(command).toContain("do --ignore-errors { printenv PATH }");
+    expect(command).not.toContain("|| true");
+    expect(command).toContain("__T3CODE_ENV_PATH_START__");
+    expect(command).toContain("__T3CODE_ENV_PATH_END__");
+  });
+
   it("extracts multiple environment variables from a login shell command", () => {
     const execFile = vi.fn<
       (
