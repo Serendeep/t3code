@@ -929,7 +929,7 @@ describe("VcsStatusBroadcaster", () => {
               );
               if (acquireCalls === 1) {
                 yield* Deferred.succeed(opening, undefined);
-                yield* Effect.never;
+                return yield* Effect.never;
               }
               return Stream.never;
             }),
@@ -1153,10 +1153,8 @@ describe("VcsStatusBroadcaster", () => {
           Effect.forkScoped,
         );
         yield* Deferred.await(secondLocalStatusCompleted);
-        yield* Effect.yieldNow;
-        const secondAttemptWhileFirstIsBlocked = yield* Deferred.poll(secondWatchPathAttempt);
+        yield* Deferred.await(secondWatchPathAttempt);
         yield* Deferred.succeed(releaseFirstWatchPath, undefined);
-        assert.isTrue(Option.isSome(secondAttemptWhileFirstIsBlocked));
       });
 
       yield* program.pipe(

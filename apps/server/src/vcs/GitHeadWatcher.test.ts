@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - exercise the native registration boundary and atomic HEAD replacement.
 import * as NodeEvents from "node:events";
 import * as NodeFS from "node:fs";
 import { assert, it } from "@effect/vitest";
@@ -41,6 +42,7 @@ it.effect("registers listeners before returning and buffers events before consum
     const events = yield* GitHeadWatcher.make(watch)
       .acquire("/repo/.git")
       .pipe(Scope.provide(scope));
+    assert.deepStrictEqual(watch.mock.calls[0]?.[1], { recursive: false });
     assert.equal(native.listenerCount("error"), 1);
     assert.equal(native.listenerCount("close"), 1);
     const callback = watch.mock.calls[0]?.[2];
@@ -90,7 +92,7 @@ it.effect("closes a failed watcher before a fresh registration is acquired", () 
     assert.equal(first.closeCalls, 1);
 
     yield* Effect.gen(function* () {
-      yield* service.acquire("/repo/.git");
+      yield* service.acquire("/repo/.git").pipe(Effect.asVoid);
       assert.equal(first.closeCalls, 1);
       assert.equal(second.closeCalls, 0);
     }).pipe(Effect.scoped);

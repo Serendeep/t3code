@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - FileSystem.watch does not expose native registration readiness.
 import * as NodeFS from "node:fs";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -46,7 +47,7 @@ export const make = (
       yield* Effect.acquireRelease(
         Effect.try({
           try: () => {
-            const watcher = watch(directory, { recursive: true }, (_event, filename) => {
+            const watcher = watch(directory, { recursive: false }, (_event, filename) => {
               Queue.offerUnsafe(events, filename);
             });
             watcher.on("error", (cause) =>
