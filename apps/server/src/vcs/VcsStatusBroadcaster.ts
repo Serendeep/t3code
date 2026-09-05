@@ -28,6 +28,7 @@ import { mergeGitStatusParts } from "@t3tools/shared/git";
 import * as BackgroundPolicy from "../background/BackgroundPolicy.ts";
 import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as GitHeadWatcher from "./GitHeadWatcher.ts";
 
 const DEFAULT_VCS_STATUS_REFRESH_INTERVAL = Duration.seconds(30);
 const LOCAL_WATCH_RESTART_DELAY = Duration.seconds(1);
@@ -227,6 +228,7 @@ const normalizeCwd = (cwd: string) =>
 export const make = Effect.gen(function* () {
   const autoPullPolicy = yield* VcsAutoPullPolicy;
   const workflow = yield* GitWorkflowService.GitWorkflowService;
+  const headWatcher = yield* GitHeadWatcher.GitHeadWatcher;
   const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -342,15 +344,30 @@ export const make = Effect.gen(function* () {
   const updateCachedStatus = Effect.fn("VcsStatusBroadcaster.updateCachedStatus")(function* (
     cwd: string,
     proposedLocal: CachedLocalStatus,
-    remote: VcsStatusRemoteResult | null,
+    proposedRemote: VcsStatusRemoteResult | null,
     options?: { publish?: boolean },
   ) {
     const nextRemote = {
-      fingerprint: fingerprintStatusPart(remote),
-      value: remote,
+      fingerprint: fingerprintStatusPart(proposedRemote),
+      value: proposedRemote,
     } satisfies CachedValue<VcsStatusRemoteResult | null>;
-    const { local, shouldPublish } = yield* Ref.modify(cacheRef, (cache) => {
+    const { local, remote, shouldPublish } = yield* Ref.modify(cacheRef, (cache) => {
       const previous = cache.get(cwd) ?? { local: null, remote: null };
+      // Remote data from an older ref must not be paired with a newer HEAD result.
+      if (
+        previous.local &&
+        previous.local.readOrder > proposedLocal.readOrder &&
+        previous.local.value.refName !== proposedLocal.value.refName
+      ) {
+        return [
+          {
+            local: previous.local.value,
+            remote: previous.remote?.value ?? null,
+            shouldPublish: false,
+          },
+          cache,
+        ] as const;
+      }
       const nextLocal =
         previous.local && previous.local.readOrder > proposedLocal.readOrder
           ? previous.local
@@ -363,6 +380,7 @@ export const make = Effect.gen(function* () {
       return [
         {
           local: nextLocal.value,
+          remote: proposedRemote,
           shouldPublish:
             previous.local?.fingerprint !== nextLocal.fingerprint ||
             previous.remote?.fingerprint !== nextRemote.fingerprint,
@@ -462,20 +480,21 @@ export const make = Effect.gen(function* () {
     const watchPath = Effect.fn("VcsStatusBroadcaster.watchLocalStatusPath")(function* (
       rawHeadPath: string | null,
     ) {
-      if (rawHeadPath === null) {
-        return;
-      }
+      if (rawHeadPath === null) return;
 
       const headPath = path.isAbsolute(rawHeadPath) ? rawHeadPath : path.resolve(cwd, rawHeadPath);
       const headDirectory = path.dirname(headPath);
       const headFileName = path.basename(headPath);
+      const events = yield* headWatcher.acquire(headDirectory);
+      yield* refreshSafely;
       yield* Stream.runForEach(
-        fs.watch(headDirectory).pipe(
-          Stream.filter((event) => {
+        events.pipe(
+          Stream.filter((eventPath) => {
             return (
-              event.path === headPath ||
-              event.path === headFileName ||
-              path.resolve(headDirectory, event.path) === headPath
+              eventPath === null ||
+              eventPath === headPath ||
+              eventPath === headFileName ||
+              path.resolve(headDirectory, eventPath) === headPath
             );
           }),
           Stream.debounce(Duration.millis(50)),
@@ -486,7 +505,7 @@ export const make = Effect.gen(function* () {
             yield* refreshSafely;
           }),
       );
-    });
+    }, Effect.scoped);
     const runWatchAttempt = Effect.fn("VcsStatusBroadcaster.runLocalStatusWatchAttempt")(function* <
       E,
       R,
