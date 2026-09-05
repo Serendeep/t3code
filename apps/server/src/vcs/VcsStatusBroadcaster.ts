@@ -144,6 +144,7 @@ interface ActiveRemotePoller {
 interface ActiveLocalWatcher {
   readonly fiber: Fiber.Fiber<void, never>;
   readonly subscriberCount: number;
+  readonly statusLock: Semaphore.Semaphore;
 }
 
 interface StreamStatusOptions {
@@ -422,7 +423,10 @@ export const make = Effect.gen(function* () {
       return null;
     }
 
+    const statusLock = yield* Semaphore.make(1);
+    let restartDelay = LOCAL_WATCH_RESTART_DELAY;
     const refreshSafely = refreshLocalStatusCore(cwd).pipe(
+      statusLock.withPermits(1),
       Effect.ignoreCause({ log: true }),
       Effect.asVoid,
     );
@@ -447,14 +451,18 @@ export const make = Effect.gen(function* () {
           }),
           Stream.debounce(Duration.millis(50)),
         ),
-        () => refreshSafely,
+        () =>
+          Effect.gen(function* () {
+            restartDelay = LOCAL_WATCH_RESTART_DELAY;
+            yield* refreshSafely;
+          }),
       );
     });
     const runWatchAttempt = Effect.fn("VcsStatusBroadcaster.runLocalStatusWatchAttempt")(function* <
       E,
       R,
     >(attempt: Effect.Effect<void, E, R>) {
-      yield* attempt.pipe(
+      const [elapsed] = yield* attempt.pipe(
         Effect.catch((error) =>
           Effect.logWarning("Git HEAD watcher failed; restarting", {
             cwdLength: cwd.length,
@@ -462,20 +470,29 @@ export const make = Effect.gen(function* () {
             failureOperation: diagnosticFailureOperation(error),
           }),
         ),
+        Effect.timed,
       );
+      if (Duration.isGreaterThanOrEqualTo(elapsed, LOCAL_WATCH_MAX_RESTART_DELAY)) {
+        restartDelay = LOCAL_WATCH_RESTART_DELAY;
+      }
     });
     const firstWatchAttempt = Effect.fromResult(initialWatchPath).pipe(Effect.flatMap(watchPath));
     const nextWatchAttempt = workflow.localStatusWatchPath({ cwd }).pipe(Effect.flatMap(watchPath));
 
-    return Effect.gen(function* () {
-      yield* runWatchAttempt(firstWatchAttempt);
-      let restartDelay = LOCAL_WATCH_RESTART_DELAY;
-      while (true) {
-        yield* Effect.sleep(restartDelay);
-        yield* runWatchAttempt(nextWatchAttempt);
-        restartDelay = Duration.min(Duration.times(restartDelay, 2), LOCAL_WATCH_MAX_RESTART_DELAY);
-      }
-    });
+    return {
+      statusLock,
+      run: Effect.gen(function* () {
+        yield* runWatchAttempt(firstWatchAttempt);
+        while (true) {
+          yield* Effect.sleep(restartDelay);
+          restartDelay = Duration.min(
+            Duration.times(restartDelay, 2),
+            LOCAL_WATCH_MAX_RESTART_DELAY,
+          );
+          yield* runWatchAttempt(nextWatchAttempt);
+        }
+      }),
+    };
   });
 
   const retainLocalWatcher = Effect.fn("VcsStatusBroadcaster.retainLocalWatcher")(function* (
@@ -484,7 +501,7 @@ export const make = Effect.gen(function* () {
     const retainedExisting = yield* SynchronizedRef.modify(localWatchersRef, (activeWatchers) => {
       const existing = activeWatchers.get(cwd);
       if (!existing) {
-        return [false, activeWatchers] as const;
+        return [null, activeWatchers] as const;
       }
 
       const nextWatchers = new Map(activeWatchers);
@@ -492,15 +509,15 @@ export const make = Effect.gen(function* () {
         ...existing,
         subscriberCount: existing.subscriberCount + 1,
       });
-      return [true, nextWatchers] as const;
+      return [existing.statusLock, nextWatchers] as const;
     });
     if (retainedExisting) {
-      return true;
+      return retainedExisting;
     }
 
     const watcher = yield* prepareLocalWatcher(cwd);
     if (watcher === null) {
-      return false;
+      return null;
     }
 
     return yield* SynchronizedRef.modifyEffect(localWatchersRef, (activeWatchers) => {
@@ -511,15 +528,15 @@ export const make = Effect.gen(function* () {
           ...existing,
           subscriberCount: existing.subscriberCount + 1,
         });
-        return Effect.succeed([true, nextWatchers] as const);
+        return Effect.succeed([existing.statusLock, nextWatchers] as const);
       }
 
-      return watcher.pipe(
+      return watcher.run.pipe(
         Effect.forkIn(broadcasterScope, { startImmediately: true }),
         Effect.map((fiber) => {
           const nextWatchers = new Map(activeWatchers);
-          nextWatchers.set(cwd, { fiber, subscriberCount: 1 });
-          return [true, nextWatchers] as const;
+          nextWatchers.set(cwd, { fiber, subscriberCount: 1, statusLock: watcher.statusLock });
+          return [watcher.statusLock, nextWatchers] as const;
         }),
       );
     });
@@ -841,12 +858,17 @@ export const make = Effect.gen(function* () {
         const cwd = yield* withFileSystem(normalizeCwd(input.cwd));
         const subscription = yield* PubSub.subscribe(changesPubSub);
         let initialLocal = yield* getOrLoadLocalStatus(cwd);
-        const retainedLocalWatcher = yield* Effect.acquireRelease(retainLocalWatcher(cwd), () =>
-          releaseLocalWatcher(cwd),
+        const localWatchStatusLock = yield* Effect.acquireRelease(
+          retainLocalWatcher(cwd),
+          (lock) => (lock === null ? Effect.void : releaseLocalWatcher(cwd)),
         );
-        if (retainedLocalWatcher) {
-          yield* workflow.invalidateLocalStatus(cwd);
-          initialLocal = yield* loadLocalStatus(cwd);
+        if (localWatchStatusLock) {
+          initialLocal = yield* localWatchStatusLock.withPermits(1)(
+            Effect.gen(function* () {
+              yield* workflow.invalidateLocalStatus(cwd);
+              return yield* loadLocalStatus(cwd);
+            }),
+          );
         }
         const cachedStatus = yield* getCachedStatus(cwd);
         const initialRemote = cachedStatus?.remote?.value ?? null;
